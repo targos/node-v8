@@ -9,7 +9,7 @@
 #include "src/objects/map.h"
 #include "src/objects/objects.h"
 #include "src/objects/visitors.h"
-#include "torque-generated/field-offsets-tq.h"
+#include "torque-generated/field-offsets.h"
 
 namespace v8 {
 namespace internal {
@@ -30,7 +30,6 @@ namespace internal {
   V(EphemeronHashTable)                \
   V(FeedbackCell)                      \
   V(FeedbackMetadata)                  \
-  V(FeedbackVector)                    \
   V(FixedDoubleArray)                  \
   V(JSArrayBuffer)                     \
   V(JSDataView)                        \
@@ -58,7 +57,6 @@ namespace internal {
   V(UncompiledDataWithoutPreparseData) \
   V(UncompiledDataWithPreparseData)    \
   V(WasmArray)                         \
-  V(WasmCapiFunctionData)              \
   V(WasmIndirectFunctionTable)         \
   V(WasmInstanceObject)                \
   V(WasmStruct)                        \

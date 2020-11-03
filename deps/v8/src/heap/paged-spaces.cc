@@ -137,13 +137,14 @@ void PagedSpace::RefillFreeList() {
         owner->RefineAllocatedBytesAfterSweeping(p);
         owner->RemovePage(p);
         added += AddPage(p);
+        added += p->wasted_memory();
       } else {
         base::MutexGuard guard(mutex());
         DCHECK_EQ(this, p->owner());
         RefineAllocatedBytesAfterSweeping(p);
         added += RelinkFreeListCategories(p);
+        added += p->wasted_memory();
       }
-      added += p->wasted_memory();
       if (is_compaction_space() && (added > kCompactionMemoryWanted)) break;
     }
   }
@@ -180,7 +181,6 @@ void PagedSpace::MergeLocalSpace(LocalSpace* other) {
     // Relinking requires the category to be unlinked.
     other->RemovePage(p);
     AddPage(p);
-    heap()->NotifyOldGenerationExpansion(identity(), p);
     DCHECK_IMPLIES(
         !p->IsFlagSet(Page::NEVER_ALLOCATE_ON_PAGE),
         p->AvailableInFreeList() == p->AvailableInFreeListFromAllocatedBytes());
@@ -192,6 +192,9 @@ void PagedSpace::MergeLocalSpace(LocalSpace* other) {
     // We'll have to come up with a better solution for allocation stepping
     // before shipping, which will likely be using LocalHeap.
   }
+  for (auto p : other->GetNewPages()) {
+    heap()->NotifyOldGenerationExpansion(identity(), p);
+  }
 
   DCHECK_EQ(0u, other->Size());
   DCHECK_EQ(0u, other->Capacity());
@@ -200,6 +203,7 @@ void PagedSpace::MergeLocalSpace(LocalSpace* other) {
 size_t PagedSpace::CommittedPhysicalMemory() {
   if (!base::OS::HasLazyCommits()) return CommittedMemory();
   BasicMemoryChunk::UpdateHighWaterMark(allocation_info_.top());
+  base::MutexGuard guard(mutex());
   size_t size = 0;
   for (Page* page : *this) {
     size += page->CommittedPhysicalMemory();
@@ -451,7 +455,9 @@ void PagedSpace::ReleasePage(Page* page) {
     SetTopAndLimit(kNullAddress, kNullAddress);
   }
 
-  heap()->isolate()->RemoveCodeMemoryChunk(page);
+  if (identity() == CODE_SPACE) {
+    heap()->isolate()->RemoveCodeMemoryChunk(page);
+  }
 
   AccountUncommitted(page->size());
   accounting_stats_.DecreaseCapacity(page->area_size());
@@ -827,9 +833,27 @@ bool PagedSpace::RefillLabMain(int size_in_bytes, AllocationOrigin origin) {
   return RawRefillLabMain(size_in_bytes, origin);
 }
 
+Page* LocalSpace::Expand() {
+  Page* page = PagedSpace::Expand();
+  new_pages_.push_back(page);
+  return page;
+}
+
 bool CompactionSpace::RefillLabMain(int size_in_bytes,
                                     AllocationOrigin origin) {
   return RawRefillLabMain(size_in_bytes, origin);
+}
+
+bool PagedSpace::TryExpand(int size_in_bytes, AllocationOrigin origin) {
+  Page* page = Expand();
+  if (!page) return false;
+  if (!is_compaction_space()) {
+    heap()->NotifyOldGenerationExpansion(identity(), page);
+  }
+  DCHECK((CountTotalPages() > 1) ||
+         (static_cast<size_t>(size_in_bytes) <= free_list_->Available()));
+  return TryAllocationFromFreeListMain(static_cast<size_t>(size_in_bytes),
+                                       origin);
 }
 
 bool PagedSpace::RawRefillLabMain(int size_in_bytes, AllocationOrigin origin) {
@@ -874,33 +898,22 @@ bool PagedSpace::RawRefillLabMain(int size_in_bytes, AllocationOrigin origin) {
 
   if (heap()->ShouldExpandOldGenerationOnSlowAllocation() &&
       heap()->CanExpandOldGeneration(AreaSize())) {
-    Page* page = Expand();
-    if (page) {
-      if (!is_compaction_space()) {
-        heap()->NotifyOldGenerationExpansion(identity(), page);
-      }
-      DCHECK((CountTotalPages() > 1) ||
-             (static_cast<size_t>(size_in_bytes) <= free_list_->Available()));
-      return TryAllocationFromFreeListMain(static_cast<size_t>(size_in_bytes),
-                                           origin);
+    if (TryExpand(size_in_bytes, origin)) {
+      return true;
     }
   }
 
-  if (is_compaction_space()) {
-    return ContributeToSweepingMain(0, 0, size_in_bytes, origin);
-
-  } else {
-    DCHECK(!is_local_space());
-    if (collector->sweeping_in_progress()) {
-      // Complete sweeping for this space.
-      collector->DrainSweepingWorklistForSpace(identity());
-      RefillFreeList();
-
-      // Last try to acquire memory from free list.
-      return TryAllocationFromFreeListMain(size_in_bytes, origin);
-    }
-    return false;
+  // Try sweeping all pages.
+  if (ContributeToSweepingMain(0, 0, size_in_bytes, origin)) {
+    return true;
   }
+
+  if (heap()->gc_state() != Heap::NOT_IN_GC && !heap()->force_oom()) {
+    // Avoid OOM crash in the GC in order to invoke NearHeapLimitCallback after
+    // GC and give it a chance to increase the heap limit.
+    return TryExpand(size_in_bytes, origin);
+  }
+  return false;
 }
 
 bool PagedSpace::ContributeToSweepingMain(int required_freed_bytes,
@@ -914,12 +927,11 @@ bool PagedSpace::ContributeToSweepingMain(int required_freed_bytes,
 
   MarkCompactCollector* collector = heap()->mark_compact_collector();
   if (collector->sweeping_in_progress()) {
-    int max_freed = collector->sweeper()->ParallelSweepSpace(
-        identity(), required_freed_bytes, max_pages,
-        invalidated_slots_in_free_space);
+    collector->sweeper()->ParallelSweepSpace(identity(), required_freed_bytes,
+                                             max_pages,
+                                             invalidated_slots_in_free_space);
     RefillFreeList();
-    if (max_freed >= size_in_bytes)
-      return TryAllocationFromFreeListMain(size_in_bytes, origin);
+    return TryAllocationFromFreeListMain(size_in_bytes, origin);
   }
   return false;
 }

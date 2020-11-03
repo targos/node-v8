@@ -722,6 +722,9 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     case IrOpcode::kJSLoadNamed:
       CheckTypeIs(node, Type::Any());
       break;
+    case IrOpcode::kJSLoadNamedFromSuper:
+      CheckTypeIs(node, Type::Any());
+      break;
     case IrOpcode::kJSLoadGlobal:
       CheckTypeIs(node, Type::Any());
       CHECK(LoadGlobalParametersOf(node->op()).feedback().IsValid());
@@ -760,6 +763,7 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
     case IrOpcode::kTypeOf:
       CheckTypeIs(node, Type::InternalizedString());
       break;
+    case IrOpcode::kTierUpCheck:
     case IrOpcode::kUpdateInterruptBudget:
       CheckValueInputIs(node, 0, Type::Any());
       CheckNotTyped(node);
@@ -768,7 +772,7 @@ void Verifier::Visitor::Check(Node* node, const AllNodes& all) {
       // We don't check the input for Type::Function because this_function can
       // be context-allocated.
       CheckValueInputIs(node, 0, Type::Any());
-      CheckTypeIs(node, Type::Callable());
+      CheckTypeIs(node, Type::NonInternal());
       break;
 
     case IrOpcode::kJSHasContextExtension:

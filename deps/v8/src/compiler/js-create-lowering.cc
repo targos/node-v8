@@ -28,7 +28,6 @@
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/template-objects.h"
-#include "torque-generated/exported-class-definitions-tq.h"
 
 namespace v8 {
 namespace internal {
@@ -1496,7 +1495,7 @@ Node* JSCreateLowering::AllocateAliasedArguments(
   }
 
   // Calculate number of argument values being aliased/mapped.
-  int mapped_count = Min(argument_count, parameter_count);
+  int mapped_count = std::min(argument_count, parameter_count);
   *has_aliased_arguments = true;
 
   // Prepare an iterator over argument values recorded in the frame state.
@@ -1770,10 +1769,11 @@ Node* JSCreateLowering::AllocateFastLiteralElements(Node* effect, Node* control,
   if (elements_map.instance_type() == FIXED_DOUBLE_ARRAY_TYPE) {
     FixedDoubleArrayRef elements = boilerplate_elements.AsFixedDoubleArray();
     for (int i = 0; i < elements_length; ++i) {
-      if (elements.is_the_hole(i)) {
+      Float64 value = elements.get(i);
+      if (value.is_hole_nan()) {
         elements_values[i] = jsgraph()->TheHoleConstant();
       } else {
-        elements_values[i] = jsgraph()->Constant(elements.get_scalar(i));
+        elements_values[i] = jsgraph()->Constant(value.get_scalar());
       }
     }
   } else {

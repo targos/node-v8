@@ -17,6 +17,7 @@
 #include "src/objects/ordered-hash-table-inl.h"
 #include "src/objects/property-descriptor.h"
 #include "src/objects/prototype.h"
+#include "src/objects/slots-atomic-inl.h"
 #include "src/utils/identity-map.h"
 #include "src/zone/zone-hashmap.h"
 
@@ -67,7 +68,8 @@ static Handle<FixedArray> CombineKeys(Isolate* isolate,
   int nof_descriptors = map.NumberOfOwnDescriptors();
   if (nof_descriptors == 0 && !may_have_elements) return prototype_chain_keys;
 
-  Handle<DescriptorArray> descs(map.instance_descriptors(), isolate);
+  Handle<DescriptorArray> descs(map.instance_descriptors(kRelaxedLoad),
+                                isolate);
   int own_keys_length = own_keys.is_null() ? 0 : own_keys->length();
   Handle<FixedArray> combined_keys = isolate->factory()->NewFixedArray(
       own_keys_length + prototype_chain_keys_length);
@@ -369,8 +371,8 @@ Handle<FixedArray> ReduceFixedArrayTo(Isolate* isolate,
 Handle<FixedArray> GetFastEnumPropertyKeys(Isolate* isolate,
                                            Handle<JSObject> object) {
   Handle<Map> map(object->map(), isolate);
-  Handle<FixedArray> keys(map->instance_descriptors().enum_cache().keys(),
-                          isolate);
+  Handle<FixedArray> keys(
+      map->instance_descriptors(kRelaxedLoad).enum_cache().keys(), isolate);
 
   // Check if the {map} has a valid enum length, which implies that it
   // must have a valid enum cache as well.
@@ -395,7 +397,7 @@ Handle<FixedArray> GetFastEnumPropertyKeys(Isolate* isolate,
   }
 
   Handle<DescriptorArray> descriptors =
-      Handle<DescriptorArray>(map->instance_descriptors(), isolate);
+      Handle<DescriptorArray>(map->instance_descriptors(kRelaxedLoad), isolate);
   isolate->counters()->enum_cache_misses()->Increment();
 
   // Create the keys array.
@@ -810,6 +812,61 @@ base::Optional<int> CollectOwnPropertyNamesInternal(
   return first_skipped;
 }
 
+// Copies enumerable keys to preallocated fixed array.
+// Does not throw for uninitialized exports in module namespace objects, so
+// this has to be checked separately.
+template <typename Dict>
+void CopyEnumKeysTo(Isolate* isolate, Handle<Dict> dictionary,
+                    Handle<FixedArray> storage, KeyCollectionMode mode,
+                    KeyAccumulator* accumulator) {
+  DCHECK_IMPLIES(mode != KeyCollectionMode::kOwnOnly, accumulator != nullptr);
+  int length = storage->length();
+  int properties = 0;
+  ReadOnlyRoots roots(isolate);
+  {
+    AllowHeapAllocation allow_gc;
+    for (InternalIndex i : dictionary->IterateEntries()) {
+      Object key;
+      if (!dictionary->ToKey(roots, i, &key)) continue;
+      bool is_shadowing_key = false;
+      if (key.IsSymbol()) continue;
+      PropertyDetails details = dictionary->DetailsAt(i);
+      if (details.IsDontEnum()) {
+        if (mode == KeyCollectionMode::kIncludePrototypes) {
+          is_shadowing_key = true;
+        } else {
+          continue;
+        }
+      }
+      if (is_shadowing_key) {
+        // This might allocate, but {key} is not used afterwards.
+        accumulator->AddShadowingKey(key, &allow_gc);
+        continue;
+      } else {
+        storage->set(properties, Smi::FromInt(i.as_int()));
+      }
+      properties++;
+      if (mode == KeyCollectionMode::kOwnOnly && properties == length) break;
+    }
+  }
+
+  CHECK_EQ(length, properties);
+  {
+    DisallowHeapAllocation no_gc;
+    Dict raw_dictionary = *dictionary;
+    FixedArray raw_storage = *storage;
+    EnumIndexComparator<Dict> cmp(raw_dictionary);
+    // Use AtomicSlot wrapper to ensure that std::sort uses atomic load and
+    // store operations that are safe for concurrent marking.
+    AtomicSlot start(storage->GetFirstElementAddress());
+    std::sort(start, start + length, cmp);
+    for (int i = 0; i < length; i++) {
+      InternalIndex index(Smi::ToInt(raw_storage.get(i)));
+      raw_storage.set(i, raw_dictionary.NameAt(index));
+    }
+  }
+}
+
 template <class T>
 Handle<FixedArray> GetOwnEnumPropertyDictionaryKeys(Isolate* isolate,
                                                     KeyCollectionMode mode,
@@ -822,9 +879,77 @@ Handle<FixedArray> GetOwnEnumPropertyDictionaryKeys(Isolate* isolate,
   }
   int length = dictionary->NumberOfEnumerableProperties();
   Handle<FixedArray> storage = isolate->factory()->NewFixedArray(length);
-  T::CopyEnumKeysTo(isolate, dictionary, storage, mode, accumulator);
+  CopyEnumKeysTo(isolate, dictionary, storage, mode, accumulator);
   return storage;
 }
+
+// Collect the keys from |dictionary| into |keys|, in ascending chronological
+// order of property creation.
+template <typename Dictionary>
+ExceptionStatus CollectKeysFromDictionary(Handle<Dictionary> dictionary,
+                                          KeyAccumulator* keys) {
+  Isolate* isolate = keys->isolate();
+  ReadOnlyRoots roots(isolate);
+  // TODO(jkummerow): Consider using a std::unique_ptr<InternalIndex[]> instead.
+  Handle<FixedArray> array =
+      isolate->factory()->NewFixedArray(dictionary->NumberOfElements());
+  int array_size = 0;
+  PropertyFilter filter = keys->filter();
+  // Handle enumerable strings in CopyEnumKeysTo.
+  DCHECK_NE(keys->filter(), ENUMERABLE_STRINGS);
+  {
+    DisallowHeapAllocation no_gc;
+    for (InternalIndex i : dictionary->IterateEntries()) {
+      Object key;
+      Dictionary raw_dictionary = *dictionary;
+      if (!raw_dictionary.ToKey(roots, i, &key)) continue;
+      if (key.FilterKey(filter)) continue;
+      PropertyDetails details = raw_dictionary.DetailsAt(i);
+      if ((details.attributes() & filter) != 0) {
+        AllowHeapAllocation gc;
+        // This might allocate, but {key} is not used afterwards.
+        keys->AddShadowingKey(key, &gc);
+        continue;
+      }
+      if (filter & ONLY_ALL_CAN_READ) {
+        if (details.kind() != kAccessor) continue;
+        Object accessors = raw_dictionary.ValueAt(i);
+        if (!accessors.IsAccessorInfo()) continue;
+        if (!AccessorInfo::cast(accessors).all_can_read()) continue;
+      }
+      array->set(array_size++, Smi::FromInt(i.as_int()));
+    }
+
+    EnumIndexComparator<Dictionary> cmp(*dictionary);
+    // Use AtomicSlot wrapper to ensure that std::sort uses atomic load and
+    // store operations that are safe for concurrent marking.
+    AtomicSlot start(array->GetFirstElementAddress());
+    std::sort(start, start + array_size, cmp);
+  }
+
+  bool has_seen_symbol = false;
+  for (int i = 0; i < array_size; i++) {
+    InternalIndex index(Smi::ToInt(array->get(i)));
+    Object key = dictionary->NameAt(index);
+    if (key.IsSymbol()) {
+      has_seen_symbol = true;
+      continue;
+    }
+    ExceptionStatus status = keys->AddKey(key, DO_NOT_CONVERT);
+    if (!status) return status;
+  }
+  if (has_seen_symbol) {
+    for (int i = 0; i < array_size; i++) {
+      InternalIndex index(Smi::ToInt(array->get(i)));
+      Object key = dictionary->NameAt(index);
+      if (!key.IsSymbol()) continue;
+      ExceptionStatus status = keys->AddKey(key, DO_NOT_CONVERT);
+      if (!status) return status;
+    }
+  }
+  return ExceptionStatus::kSuccess;
+}
+
 }  // namespace
 
 Maybe<bool> KeyAccumulator::CollectOwnPropertyNames(Handle<JSReceiver> receiver,
@@ -840,8 +965,8 @@ Maybe<bool> KeyAccumulator::CollectOwnPropertyNames(Handle<JSReceiver> receiver,
       if (enum_keys->length() != nof_descriptors) {
         if (map.prototype(isolate_) != ReadOnlyRoots(isolate_).null_value()) {
           AllowHeapAllocation allow_gc;
-          Handle<DescriptorArray> descs =
-              Handle<DescriptorArray>(map.instance_descriptors(), isolate_);
+          Handle<DescriptorArray> descs = Handle<DescriptorArray>(
+              map.instance_descriptors(kRelaxedLoad), isolate_);
           for (InternalIndex i : InternalIndex::Range(nof_descriptors)) {
             PropertyDetails details = descs->GetDetails(i);
             if (!details.IsDontEnum()) continue;
@@ -873,8 +998,8 @@ Maybe<bool> KeyAccumulator::CollectOwnPropertyNames(Handle<JSReceiver> receiver,
   } else {
     if (object->HasFastProperties()) {
       int limit = object->map().NumberOfOwnDescriptors();
-      Handle<DescriptorArray> descs(object->map().instance_descriptors(),
-                                    isolate_);
+      Handle<DescriptorArray> descs(
+          object->map().instance_descriptors(kRelaxedLoad), isolate_);
       // First collect the strings,
       base::Optional<int> first_symbol =
           CollectOwnPropertyNamesInternal<true>(object, this, descs, 0, limit);
@@ -885,11 +1010,11 @@ Maybe<bool> KeyAccumulator::CollectOwnPropertyNames(Handle<JSReceiver> receiver,
             object, this, descs, first_symbol.value(), limit));
       }
     } else if (object->IsJSGlobalObject()) {
-      RETURN_NOTHING_IF_NOT_SUCCESSFUL(GlobalDictionary::CollectKeysTo(
+      RETURN_NOTHING_IF_NOT_SUCCESSFUL(CollectKeysFromDictionary(
           handle(JSGlobalObject::cast(*object).global_dictionary(), isolate_),
           this));
     } else {
-      RETURN_NOTHING_IF_NOT_SUCCESSFUL(NameDictionary::CollectKeysTo(
+      RETURN_NOTHING_IF_NOT_SUCCESSFUL(CollectKeysFromDictionary(
           handle(object->property_dictionary(), isolate_), this));
     }
   }
@@ -902,15 +1027,15 @@ ExceptionStatus KeyAccumulator::CollectPrivateNames(Handle<JSReceiver> receiver,
   DCHECK_EQ(mode_, KeyCollectionMode::kOwnOnly);
   if (object->HasFastProperties()) {
     int limit = object->map().NumberOfOwnDescriptors();
-    Handle<DescriptorArray> descs(object->map().instance_descriptors(),
-                                  isolate_);
+    Handle<DescriptorArray> descs(
+        object->map().instance_descriptors(kRelaxedLoad), isolate_);
     CollectOwnPropertyNamesInternal<false>(object, this, descs, 0, limit);
   } else if (object->IsJSGlobalObject()) {
-    RETURN_FAILURE_IF_NOT_SUCCESSFUL(GlobalDictionary::CollectKeysTo(
+    RETURN_FAILURE_IF_NOT_SUCCESSFUL(CollectKeysFromDictionary(
         handle(JSGlobalObject::cast(*object).global_dictionary(), isolate_),
         this));
   } else {
-    RETURN_FAILURE_IF_NOT_SUCCESSFUL(NameDictionary::CollectKeysTo(
+    RETURN_FAILURE_IF_NOT_SUCCESSFUL(CollectKeysFromDictionary(
         handle(object->property_dictionary(), isolate_), this));
   }
   return ExceptionStatus::kSuccess;
@@ -1021,7 +1146,7 @@ Maybe<bool> KeyAccumulator::CollectOwnJSProxyKeys(Handle<JSReceiver> receiver,
                                                   Handle<JSProxy> proxy) {
   STACK_CHECK(isolate_, Nothing<bool>());
   if (filter_ == PRIVATE_NAMES_ONLY) {
-    RETURN_NOTHING_IF_NOT_SUCCESSFUL(NameDictionary::CollectKeysTo(
+    RETURN_NOTHING_IF_NOT_SUCCESSFUL(CollectKeysFromDictionary(
         handle(proxy->property_dictionary(), isolate_), this));
     return Just(true);
   }
